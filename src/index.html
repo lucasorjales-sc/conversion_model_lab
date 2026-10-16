@@ -1,0 +1,93 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Conversion Model Lab</title>
+<meta name="description" content="Evaluate a conversion model from a file of test predictions: ranking quality, calibration, segment failure modes and targeting simulations. Runs entirely in the browser.">
+<!-- Built from src/ by build.py — edit the sources, not this file.
+     Libraries (loaded from CDN; the app needs network access the first time they load):
+       Plotly 2.35.2 (charts) · DuckDB-WASM 1.29.0 (in-browser SQL over the uploaded file).
+     Uploaded data never leaves this browser tab. -->
+<script defer src="https://cdn.jsdelivr.net/npm/plotly.js-dist-min@2.35.2/plotly.min.js"></script>
+<style>
+/*__STYLES__*/
+</style>
+</head>
+<body>
+
+<div id="onboard">
+  <div class="onboard">
+    <div class="hero">
+      <div class="brand" style="justify-content:center;margin-bottom:18px"><span class="mark" style="width:40px;height:40px;border-radius:12px"><svg viewBox="0 0 16 16" style="width:22px;height:22px"><path d="M2 12l3.5-4 3 2.5L14 4" stroke="#fff" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg></span></div>
+      <h1>Conversion Model Lab</h1>
+      <p class="lede">Is the model ready for a controlled pilot? Upload the test-set predictions to see ranking quality, stability over time, where the model fails, and how model targeting compares with today's outreach.</p>
+    </div>
+    <div id="upload-panel">
+      <div id="dropzone" class="dropzone" tabindex="0" role="button" aria-label="Upload a CSV file">
+        <div class="dz-ico"><svg viewBox="0 0 24 24"><path d="M12 16V4m0 0l-4.5 4.5M12 4l4.5 4.5M4 15v3a2 2 0 002 2h12a2 2 0 002-2v-3" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg></div>
+        <div class="big">Drop one or more CSVs of test predictions</div>
+        <div class="muted">One row per client and prediction date. Upload several files to switch between them — one is analysed at a time. Parquet also works.</div>
+        <div class="actions">
+          <button class="btn primary" id="pick-btn" style="height:40px;padding:0 22px;font-size:15px">Choose files…</button>
+          <button class="btn" id="demo-btn" style="height:40px;padding:0 22px;font-size:15px">Explore with demo data</button>
+        </div>
+        <input type="file" id="file-input" accept=".csv,.parquet,.pq,.csv.gz,.tsv,.txt" multiple hidden>
+      </div>
+      <div class="privacy"><svg viewBox="0 0 24 24" width="14" height="14"><rect x="5" y="11" width="14" height="9" rx="2" fill="none" stroke="currentColor" stroke-width="1.7"/><path d="M8 11V8a4 4 0 118 0v3" fill="none" stroke="currentColor" stroke-width="1.7"/></svg><span>Processed locally in this browser tab. Nothing is uploaded to a server.</span></div>
+      <div id="upload-error" style="margin-top:18px"></div>
+      <div class="schema-grid">
+        <div class="card">
+          <h3>Required columns</h3>
+          <p class="faint" style="margin:4px 0 12px">Matched by name (case-insensitive); you confirm or change the mapping next.</p>
+          <ul class="col-list">
+            <li><span class="cname">CLIENT_ID</span><span class="cdesc">Client identifier.</span></li>
+            <li><span class="cname">DATE_T</span><span class="cdesc">Prediction (as-of) date. Also matches <span class="mono">date</span>.</span></li>
+            <li><span class="cname">CONVERSION_TARGET</span><span class="cdesc">Converted within the outcome horizon (default 14 days) after DATE_T. Also matches <span class="mono">y_true</span>.</span></li>
+            <li><span class="cname">PREDICTED_SCORE</span><span class="cdesc">Model score used for ranking. Also matches <span class="mono">y_score</span>, <span class="mono">score_raw</span>.</span></li>
+          </ul>
+        </div>
+        <div class="card">
+          <h3>Optional columns</h3>
+          <p class="faint" style="margin:4px 0 12px">Each unlocks specific analyses. Everything else is analysed automatically as a segment or feature.</p>
+          <ul class="col-list">
+            <li><span class="cname">PREDICTED_PROBABILITY</span><span class="cdesc">Calibrated probability → calibration analysis.</span></li>
+            <li><span class="cname">PRIMARY_STUDIO_ID</span><span class="cdesc">Studio segment and per-studio caps.</span></li>
+            <li><span class="cname">PURCHASE_DATE / DAYS_TO_CONVERSION</span><span class="cdesc">Exact purchase dates for campaign-level counting.</span></li>
+            <li><span class="cname">CURRENT_STRATEGY_FLAG</span><span class="cdesc">Today's targeting, for a like-for-like comparison.</span></li>
+            <li><span class="cname">SPLIT · MODEL_VERSION · TREATMENT_GROUP</span><span class="cdesc">Test isolation, version filter, experiments.</span></li>
+          </ul>
+        </div>
+      </div>
+    </div>
+    <div id="mapping-panel" class="hidden"></div>
+  </div>
+</div>
+
+<div id="app" class="hidden">
+  <header class="topbar">
+    <div class="topbar-inner">
+      <div class="brand"><span class="mark"><svg viewBox="0 0 16 16"><path d="M2 12l3.5-4 3 2.5L14 4" stroke="#fff" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg></span>Conversion Model Lab</div>
+      <nav class="tabs" id="tabs" role="tablist" aria-label="Sections"></nav>
+      <div class="top-actions">
+        <button class="btn sm" id="settings-btn" data-tip="Evaluation window, split, model version, outcome horizon and label maturity. Applies to every tab.">Evaluation settings</button>
+        <button class="icon-btn" id="newfile-btn" aria-label="Start over with new files" data-tip="Start over with new files (to add files to this workspace, use the file switcher)">
+          <svg viewBox="0 0 24 24"><path d="M14 3H7a2 2 0 00-2 2v14a2 2 0 002 2h10a2 2 0 002-2V8l-5-5z" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"/><path d="M14 3v5h5" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"/></svg>
+        </button>
+      </div>
+    </div>
+  </header>
+  <div class="contextbar" id="context"></div>
+  <main id="page"></main>
+</div>
+
+<!-- Analytical engine: turned into a Web Worker via a Blob URL at runtime. -->
+<script type="text/plain" id="engine-src">
+/*__WORKER__*/
+</script>
+
+<script type="module">
+/*__APP__*/
+</script>
+</body>
+</html>
