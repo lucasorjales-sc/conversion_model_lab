@@ -2,7 +2,7 @@
    60 · SEGMENT DIAGNOSTICS
    Where it's wrong (preserved from the prototype, restyled; client level now uses
    the index-date rule instead of max score), automatic segment analysis, the
-   feature explorer, and timing of misses.
+   feature explorer, SHAP feature importance (65_importance.js) and timing of misses.
    ========================================================================== */
 const segState = () => (S.ui.seg ||= { sub: 'wrong', cutPct: 20, minN: 200, minPos: 10, tree: { mode: 'misses', level: 'client', depth: 4, minLeaf: 30, selected: null },
   segGrain: 'row', segCols: null, refCol: null, refVal: null, fx: { feat: null, type: 'auto', bin: 'quantile', bins: 10, edges: '', minN: 100, d0: null, d1: null, studio: '', fcol: '', fval: '', grain: 'row', sort: 'gap' }, timingK: 10 });
@@ -11,7 +11,7 @@ RENDER.seg = async (el, v) => {
   const U = segState();
   html(el, `
     ${pageHead('Segment Diagnostics', 'Where does the model over-predict, under-predict or miss?', 'Error analysis across every segment and feature in the file, discovered automatically. These are conditional diagnostics: a difference between groups is not evidence that a feature causes conversion.')}
-    <div class="subnav">${segHTML('ssub', [{ v: 'wrong', label: 'Where it\'s wrong' }, { v: 'segments', label: 'Segments' }, { v: 'features', label: 'Feature explorer' }, { v: 'timing', label: 'Timing of misses' }], U.sub, 'lg')}</div>
+    <div class="subnav">${segHTML('ssub', [{ v: 'wrong', label: 'Where it\'s wrong' }, { v: 'segments', label: 'Segments' }, { v: 'features', label: 'Feature explorer' }, { v: 'importance', label: 'Feature importance' }, { v: 'timing', label: 'Timing of misses' }], U.sub, 'lg')}</div>
     <div id="sg-body"></div>`);
   bindSeg(el, 'ssub', async s => { U.sub = s; await segBody(v); });
   await segBody(v);
@@ -21,6 +21,7 @@ async function segBody(v) {
   if (U.sub === 'wrong') return wrongView(body, v);
   if (U.sub === 'segments') return segmentsView(body, v);
   if (U.sub === 'features') return featureView(body, v);
+  if (U.sub === 'importance') return importanceView(body, v);
   return timingView(body, v);
 }
 
@@ -449,6 +450,7 @@ async function renderBrowsers(v) {
     const h = await q(top.map(r => { const w = (r.hi - r.lo) / B; return `SELECT ${ql(r.feature)} AS f, ${grp} AS grp, LEAST(${B - 1}, GREATEST(0, FLOOR((${qi(r.feature)}::DOUBLE - ${r.lo}) / ${w})))::INT AS b, COUNT(*) AS c FROM ${FT} WHERE ${qi(r.feature)} IS NOT NULL GROUP BY 1, 2, 3`; }).join(' UNION ALL '));
     if (stale(v)) return;
     const grid = $('#ft-grid'), c = C();
+    if (!grid) return;   // the user moved to another sub-tab while this was computing
     top.forEach(r => {
       const d = document.createElement('div'); d.className = 'chart'; grid.appendChild(d);
       const w = (r.hi - r.lo) / B, xs = Array.from({ length: B }, (_, j) => r.lo + (j + 0.5) * w);
@@ -641,6 +643,14 @@ async function featureView(body, v) {
   try { await (type === 'num' ? numericExplorer(pop, fmeta, v) : categoricalExplorer(pop, fmeta, v)); }
   catch (e) { console.error(e); html($('#fx-body'), callout('bad', `This feature could not be analysed: ${esc(e.message)}`)); }
 }
+/** Quantile bin edges of __x over `pop`, open-ended at both ends: [-∞, q1, …, ∞]. */
+async function quantileEdges(pop, k) {
+  const ps = Array.from({ length: k - 1 }, (_, i) => (i + 1) / k);
+  const r = await q1(`SELECT quantile_disc(__x::DOUBLE, [${ps.join(',')}]) AS qs FROM (${pop}) WHERE __x IS NOT NULL`);
+  return [-Infinity, ...[...new Set((r.qs || []).filter(Number.isFinite))].sort((a, b) => a - b), Infinity];
+}
+/** Bin index of __x for edges E: bin k = (E[k], E[k+1]]; −1 = missing. */
+const binCase = E => `CASE WHEN __x IS NULL THEN -1 ${E.slice(1, -1).map((e, k) => `WHEN __x::DOUBLE <= ${e} THEN ${k}`).join(' ')} ELSE ${E.length - 2} END`;
 /** Aggregate per group with client-clustered sums. groupExpr is evaluated on `pop` rows. */
 async function groupStats(pop, groupExpr) {
   return q(`WITH b AS (SELECT ${groupExpr} AS g, client_id, y, score, prob FROM (${pop})),
@@ -671,17 +681,12 @@ async function numericExplorer(pop, fmeta, v) {
     edges = [-Infinity, ...edges, Infinity];
   } else if (F.bin === 'width') {
     const w = (st.mx - st.mn) / F.bins; edges = [-Infinity, ...Array.from({ length: F.bins - 1 }, (_, i) => st.mn + (i + 1) * w), Infinity];
-  } else {
-    const ps = Array.from({ length: F.bins - 1 }, (_, i) => (i + 1) / F.bins);
-    const r = await q1(`SELECT quantile_disc(__x::DOUBLE, [${ps.join(',')}]) AS qs FROM (${pop}) WHERE __x IS NOT NULL`);
-    edges = [-Infinity, ...[...new Set((r.qs || []).filter(Number.isFinite))].sort((a, b) => a - b), Infinity];
-  }
+  } else edges = await quantileEdges(pop, F.bins);
   // bin k = (edges[k], edges[k+1]]. Adjacent bins below the minimum are merged by moving edges BEFORE aggregation,
   // so distinct-client counts stay exact (a client whose rows span two bins is never counted twice in one bin).
-  const caseOf = E => `CASE WHEN __x IS NULL THEN -1 ${E.slice(1, -1).map((e, k) => `WHEN __x::DOUBLE <= ${e} THEN ${k}`).join(' ')} ELSE ${E.length - 2} END`;
   let merged = 0;
   if (F.bin !== 'custom' && edges.length > 2) {
-    const cnt = await q(`SELECT ${caseOf(edges)} AS g, COUNT(*) AS n FROM (${pop}) GROUP BY 1`); if (stale(v)) return;
+    const cnt = await q(`SELECT ${binCase(edges)} AS g, COUNT(*) AS n FROM (${pop}) GROUP BY 1`); if (stale(v)) return;
     const nOf = new Map(cnt.map(r => [r.g, r.n]));
     const groups = []; let cur = null;
     for (let k = 0; k < edges.length - 1; k++) {
@@ -692,7 +697,7 @@ async function numericExplorer(pop, fmeta, v) {
     if (groups.length > 1 && groups[groups.length - 1].n < F.minN) { const last = groups.pop(); groups[groups.length - 1].hi = last.hi; groups[groups.length - 1].n += last.n; merged++; }
     edges = [groups[0].lo, ...groups.map(g => g.hi)];
   }
-  let rows = await groupStats(pop, caseOf(edges)); if (stale(v)) return;
+  let rows = await groupStats(pop, binCase(edges)); if (stale(v)) return;
   const missing = rows.find(r => r.g === -1); rows = rows.filter(r => r.g >= 0).sort((a, b) => a.g - b.g);
   const bins = rows.map(r => ({ ...r, eLo: edges[r.g], eHi: edges[r.g + 1] }));
   finishGroups(bins, F.minN);

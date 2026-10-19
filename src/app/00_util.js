@@ -271,6 +271,7 @@ const C = () => ({
   actual: cssVar('--actual'), predicted: cssVar('--predicted'), s1: cssVar('--s1'), s2: cssVar('--s2'), s3: cssVar('--s3'), s4: cssVar('--s4'), s5: cssVar('--s5'),
   base: cssVar('--baseline'), text: cssVar('--text'), text2: cssVar('--text-2'), text3: cssVar('--text-3'), grid: cssVar('--grid'), axis: cssVar('--axis'),
   surface: cssVar('--chart-surface'), good: cssVar('--good'), warn: cssVar('--warn'), bad: cssVar('--bad'), accent: cssVar('--accent'),
+  up: cssVar('--shap-up'), down: cssVar('--shap-down'),
 });
 const rgba = (hex, a) => { const h = hex.replace('#', ''); const n = parseInt(h.length === 3 ? h.split('').map(x => x + x).join('') : h, 16); return `rgba(${n >> 16 & 255},${n >> 8 & 255},${n & 255},${a})`; };
 const PLOT_CFG = { responsive: true, displaylogo: false, modeBarButtonsToRemove: ['lasso2d', 'select2d', 'autoScale2d', 'toggleSpikelines', 'hoverCompareCartesian', 'hoverClosestCartesian'] };

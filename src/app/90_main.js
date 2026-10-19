@@ -18,5 +18,5 @@
     html($('#upload-error'), ''); input.value = ''; history.replaceState(null, '', location.pathname + location.search);
   };
   // console access for debugging and automated tests
-  window.__lab = { S, WS, q, q1, eng, engCached, loadFile, loadFiles, switchFile, loadDemo, applySettings, go, evalWhere, unitSQL, runSelfChecks: (...a) => runSelfChecks(...a) };
+  window.__lab = { S, WS, SHAP, q, q1, eng, engCached, loadFile, loadFiles, switchFile, loadDemo, applySettings, go, evalWhere, unitSQL, shapAgg, shapCheck, curSeg, runSelfChecks: (...a) => runSelfChecks(...a) };
 })();

@@ -15,9 +15,23 @@ const NEG_DEFAULT = /^(0|0\.0+|false|f|no|n)$/i;
 async function loadFile(file) { return loadFiles([file]); }
 
 /* Synthetic demo data (generated in the browser; clearly labelled DEMO everywhere).
-   Client-level latent propensity, irregular scoring every 2 days, purchase date drives the 14-day label,
-   score = noisy function of propensity + a pre-purchase activity bump. Planted weaknesses for the diagnostics:
-   dormant clients and the 'aggregator' channel are under-scored; market MIA is over-predicted; scores drift up late. */
+   Client-level latent propensity, irregular scoring every 2 days, purchase date drives the 14-day label.
+   The score is an explicit model: logit = intercept + one additive term per feature column in the file (DEMO_TERMS),
+   so its SHAP values are exact (interventional SHAP of an additive model = term − its mean over the background,
+   here the validation split). Planted weaknesses for the diagnostics: dormant clients and the 'aggregator' channel
+   (whose visits are not recorded) are under-scored; market MIA is over-predicted; app opens jump after day 120
+   (a product release), so scores drift up while conversion does not. */
+const DEMO_TERMS = {
+  classes_30d: '0.24 * LEAST(classes_30d, 14)',
+  visits_7d: '0.62 * LEAST(visits_7d, 6)',
+  days_since_first_class: '-0.22 * ln(1 + days_since_first_class)',
+  credits_remaining: '0.05 * credits_remaining',
+  app_opens_7d: '0.11 * LEAST(app_opens_7d, 10)',
+  market: `CASE market WHEN 'MIA' THEN 0.8 WHEN 'NYC' THEN 0.1 ELSE 0 END`,
+  channel: `CASE channel WHEN 'aggregator' THEN -0.35 WHEN 'referral' THEN 0.2 ELSE 0 END`,
+  lifecycle_stage: `CASE lifecycle_stage WHEN 'New Client' THEN 0.3 WHEN 'Lapsed Member' THEN -0.45 ELSE 0 END`,
+};
+const DEMO_INTERCEPT = -7.6;
 function demoSQL(nRows) {
   const nClients = Math.round(nRows / 12);
   return `
@@ -29,7 +43,7 @@ SELECT c,
   CASE WHEN u_ch < 0.15 THEN 'aggregator' ELSE ['organic','paid_social','referral'][1+floor(random()*3)::INT] END AS channel,
   sqrt(-2*ln(1-random()))*cos(2*pi()*random()) AS z,
   floor(random()*157)::INT AS start_day,
-  random() AS u_conv, random() > 0.02 AS visible, random() < 0.15 AS dormant, 1+floor(random()*30)::INT AS conv_off
+  random() AS u_conv, random() < 0.15 AS dormant, 1+floor(random()*30)::INT AS conv_off
 FROM (SELECT range AS c, random() AS u_t, random() AS u_ch FROM range(${nClients}));
 CREATE OR REPLACE TABLE __c2 AS
 SELECT *, (u_conv < 1/(1+exp(-(-6.25 + 1.5*z + CASE client_type WHEN 'new' THEN 0.4 WHEN 'lapsed' THEN 0.3 ELSE -0.3 END)))) AS converts FROM __c;
@@ -39,19 +53,14 @@ WITH r AS (
   FROM __c2 c, range(12) t(k)
 ), s AS (
   SELECT *, COALESCE(dtc BETWEEN 1 AND 14, false)::INT AS y,
-    sqrt(-2*ln(1-random()))*cos(2*pi()*random()) AS e1, random() AS u1, random() AS u2
+    sqrt(-2*ln(1-random()))*cos(2*pi()*random()) AS e1, sqrt(-2*ln(1-random()))*cos(2*pi()*random()) AS e2,
+    random() AS u1, random() AS u2, random() AS u3,
+    CASE WHEN dtc BETWEEN 0 AND 20 THEN (20 - dtc) / 20.0 ELSE 0 END AS bump
   FROM r WHERE dtc IS NULL OR dtc >= 1
-)
+), f AS (
 SELECT 'C' || lpad(c::VARCHAR, 6, '0') AS client_id,
   (DATE '2025-01-01' + dnum::INT) AS date_t,
   y AS conversion_target,
-  1/(1+exp(-( -8.5
-     + CASE WHEN channel='aggregator' THEN 0.5 WHEN dormant THEN 0.3 ELSE 2.2 END * z
-     + CASE WHEN visible AND NOT dormant AND channel <> 'aggregator' AND dtc BETWEEN 0 AND 20 THEN 4.4*(20-dtc)/20.0 ELSE 0 END
-     + 0.95*e1
-     + CASE WHEN dnum >= 120 THEN 0.45 ELSE 0 END
-     + CASE market WHEN 'MIA' THEN 0.8 ELSE 0 END
-     + CASE client_type WHEN 'lapsed' THEN -0.6 WHEN 'new' THEN 0.2 ELSE 0 END ))) AS predicted_score,
   market, channel,
   CASE client_type WHEN 'new' THEN 'New Client' WHEN 'pack' THEN 'Non-member Client' ELSE 'Lapsed Member' END AS lifecycle_stage,
   market || '-S' || (c % 4)::VARCHAR AS primary_studio_id,
@@ -60,10 +69,13 @@ SELECT 'C' || lpad(c::VARCHAR, 6, '0') AS client_id,
   market || '-coach' || (floor(u1*45)::INT % 9) AS coach_id,
   CASE client_type WHEN 'new' THEN 1 + 2*k + floor(u2*5)::INT WHEN 'pack' THEN 20 + 2*k + floor(u2*60)::INT ELSE 120 + 2*k + floor(u2*200)::INT END AS days_since_first_class,
   CASE WHEN dormant THEN 0 ELSE greatest(1, round(4 + 2.5*z + 0.6*e1 + CASE WHEN dtc BETWEEN 0 AND 20 THEN 3 ELSE 0 END))::INT END AS classes_30d,
+  CASE WHEN dormant OR channel = 'aggregator' THEN 0 ELSE greatest(0, round(0.8 + 0.6*z + 0.8*e2 + 3.4*bump))::INT END AS visits_7d,
+  floor(u3*4)::INT + CASE WHEN dnum >= 120 THEN 3 ELSE 0 END AS app_opens_7d,
   CASE WHEN client_type='pack' THEN floor(u2*10)::INT ELSE 0 END AS credits_remaining,
   CASE WHEN dnum < 120 THEN 'validation' ELSE 'test' END AS split,
   CASE WHEN client_type = 'new' AND k <= 3 THEN 1 ELSE 0 END AS in_existing_rules
-FROM s;
+FROM s)
+SELECT *, 1/(1+exp(-(${DEMO_INTERCEPT} + ${Object.values(DEMO_TERMS).join(' + ')}))) AS predicted_score FROM f;
 DROP TABLE __c;
 DROP TABLE __c2`;
 }
@@ -84,7 +96,12 @@ async function loadDemo(nRows = 300000) {
     for (const r of bins) { blocks.push({ n: r.n, p: r.p, hi: r.hi }); while (blocks.length > 1 && blocks[blocks.length - 2].p / blocks[blocks.length - 2].n >= blocks[blocks.length - 1].p / blocks[blocks.length - 1].n) { const b = blocks.pop(), a = blocks.pop(); blocks.push({ n: a.n + b.n, p: a.p + b.p, hi: b.hi }); } }
     const last = blocks[blocks.length - 1];
     const cases = blocks.slice(0, -1).map(b => `WHEN predicted_score <= ${b.hi} THEN ${b.p / b.n}`).join(' ');
-    await q(`CREATE TABLE ${table} AS SELECT *, ${cases ? `CASE ${cases} ELSE ${last.p / last.n} END` : `${last.p / last.n}`} AS predicted_probability FROM __demo`);
+    overlay.step(52, 'Computing exact SHAP values for the demo model…');
+    const terms = Object.entries(DEMO_TERMS);
+    const bg = await q1(`SELECT ${terms.map(([, t], k) => `AVG(${t}) AS m${k}`).join(', ')} FROM __demo WHERE split = 'validation'`);
+    const base = DEMO_INTERCEPT + terms.reduce((a, _, k) => a + bg['m' + k], 0);
+    await q(`CREATE TABLE ${table} AS SELECT *, ${cases ? `CASE ${cases} ELSE ${last.p / last.n} END` : `${last.p / last.n}`} AS predicted_probability,
+      ${terms.map(([f, t], k) => `(${t}) - ${bg['m' + k]} AS ${qi('shap__' + f)}`).join(', ')}, ${base} AS shap_base_value FROM __demo`);
     await q('DROP TABLE __demo');
     const cols = (await q(`DESCRIBE ${table}`)).map(d => ({ name: d.column_name, type: d.column_type }));
     const entry = { id, name: `DEMO DATA (${nRows.toLocaleString()} synthetic rows)`, size: 0, reg: table, reader: table, cols, sig: colsSig(cols), isDemo: true, mapping: null, saved: null, summary: null, error: null };
@@ -98,6 +115,7 @@ async function loadDemo(nRows = 300000) {
 async function dropActiveData() {
   for (const t of ['data', '__invalid', '__ep', '__epi', '__cli', '__dict', '__pest']) await q(`DROP TABLE IF EXISTS ${t}`);
   S.cache.clear(); S.cohorts = []; S.filters = []; S.ui = {}; S.sim = null; S.rendered = {}; S.core = null; S.pop = null;
+  S.shap = null; SHAP.cache.clear(); SHAP.check = null;
 }
 /** Start a new workspace: forget every registered file. */
 async function resetAll() {
@@ -233,6 +251,9 @@ async function buildData() {
   // analysis table: standard names for consumed roles, original names for everything else (renamed on collision)
   overlay.step(40, 'Building the analysis table (pass 2 of 2)…');
   const consumedSrc = new Set(['client_id', 'date', 'target', 'score', 'prob'].map(r => S.roles[r]).filter(Boolean));
+  const shapDet = detectShap(S.rawCols);   // SHAP contributions exported with the predictions (62_shap.js)
+  for (const c of shapDet.cols) consumedSrc.add(c.src);
+  if (shapDet.base) consumedSrc.add(shapDet.base);
   const taken = new Set(['client_id', 'date', 'y', 'score', 'prob', '__rid', '__hb']);
   const others = [];
   for (const c of S.rawCols) {
@@ -248,7 +269,10 @@ async function buildData() {
       ${txt(R('client_id'))} AS client_id, ${dateExpr} AS date, CAST(${yExpr} AS TINYINT) AS y, ${scoreExpr} AS score, ${probSel} AS prob,
       CAST(hash(${txt(R('client_id'))} || '|' || CAST(${dateExpr} AS VARCHAR)) % 2147483647 AS INTEGER) AS __hb
       ${others.map(o => `, ${qi(o.src)} AS ${qi(o.name)}`).join('')}
+      ${shapDet.cols.map((c, k) => `, CAST(${qi(c.src)} AS FLOAT) AS __shap${k}`).join('')}
+      ${shapDet.base ? `, CAST(${qi(shapDet.base)} AS DOUBLE) AS __shap_base` : ''}
     FROM raw WHERE (${reason}) IS NULL`);
+  S.shap = shapSetup(shapDet, others);
   const nInvalid = total - validRow.n;
   if (nInvalid) {
     overlay.step(55, 'Keeping malformed rows for inspection…');
@@ -336,7 +360,7 @@ async function discover(others) {
     if (isDateType(c.type)) return ex('Date column. Derive a numeric feature (e.g. days since) to explore it.');
     ex(`Unsupported type (${c.type}).`);
   });
-  // split is a filter, not a client attribute; keep it out of the default segment list when it is constant within the evaluation
+  if (S.shap) excluded.push({ name: `${S.shap.cols[0].src}, … (${fmtInt(S.shap.cols.length)} columns)${S.shap.baseSrc ? ` + ${S.shap.baseSrc}` : ''}`, type: 'float', distinct: null, reason: 'SHAP contributions: explain the model output, so they are used by Feature importance, never as features or segments.' });
   S.disc = { segments, features, excluded };
 }
 
@@ -429,13 +453,13 @@ const dayIso = d => new Date(Date.parse(S.core.d0) + d * 864e5).toISOString().sl
 
 /* ---------------------------------------------------- evaluation population */
 /** The single SQL definition of the evaluation population (the engine receives it as a mask). */
-function evalWhere(set = S.settings) {
+function evalWhere(set = S.settings, seg = { filters: S.filters, cohorts: S.cohorts }) {
   const p = [`date BETWEEN DATE ${ql(set.d0)} AND DATE ${ql(set.d1)}`];
   if (set.split !== null && S.roles.split) p.push(`CAST(${qi(S.roles.split)} AS VARCHAR) = ${ql(set.split)}`);
   if (set.version !== null && S.roles.version) p.push(`CAST(${qi(S.roles.version)} AS VARCHAR) = ${ql(set.version)}`);
   if (set.labelsThrough) p.push(`date + ${Math.round(set.horizon)} <= DATE ${ql(set.labelsThrough)}`);
-  for (const c of S.cohorts) p.push(`(${c.sql})`);
-  for (const f of S.filters || []) p.push(filterSQL(f));
+  for (const c of seg.cohorts || []) p.push(`(${c.sql})`);
+  for (const f of seg.filters || []) p.push(filterSQL(f));
   return p.join(' AND ');
 }
 /** Evaluation units in SQL (same rules as the engine): rows, or each client's / episode's first eligible row. */
