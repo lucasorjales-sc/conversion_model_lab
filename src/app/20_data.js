@@ -112,8 +112,11 @@ async function loadDemo(nRows = 300000) {
 }
 
 /** Drop the active file's analysis tables and per-file state (the registered files stay). */
+let DATA_SEQ = 0;
 async function dropActiveData() {
-  for (const t of ['data', '__invalid', '__ep', '__epi', '__cli', '__dict', '__pest']) await q(`DROP TABLE IF EXISTS ${t}`);
+  await q('DROP VIEW IF EXISTS data');
+  if (S.dataFile) { try { await DB.db.dropFile(S.dataFile); } catch (_) { /* already gone */ } S.dataFile = null; }
+  for (const t of ['__invalid', '__ep', '__epi', '__cli', '__dict', '__pest']) await q(`DROP TABLE IF EXISTS ${t}`);
   S.cache.clear(); S.cohorts = []; S.filters = []; S.ui = {}; S.sim = null; S.rendered = {}; S.core = null; S.pop = null;
   S.shap = null; SHAP.cache.clear(); SHAP.check = null;
 }
@@ -265,13 +268,20 @@ async function buildData() {
   // role columns that are not consumed now point at their name in `data`
   for (const r of Object.keys(S.roles)) if (!CONSUMED[r]) { const o = others.find(x => x.src === S.roles[r]); if (o) S.roles[r] = o.name; }
   const probSel = S.roles.prob ? `CASE WHEN ${probExpr} BETWEEN 0 AND 1 THEN ${probExpr} END` : S.probFromScore ? `CASE WHEN ${scoreExpr} BETWEEN 0 AND 1 THEN ${scoreExpr} END` : 'CAST(NULL AS DOUBLE)';
-  await q(`CREATE TABLE data AS SELECT CAST(row_number() OVER () AS INTEGER) AS __rid,
+  // `data` is a view over a ZSTD Parquet copy of the valid rows, never an in-memory table. DuckDB-WASM keeps in-memory
+  // tables uncompressed inside its fixed ~3.1 GiB heap (a 2.4 GB CSV became a 2.7 GB table and later queries ran out of
+  // memory). The COPY streams; the Parquet file lives in a worker buffer outside that heap, and every query reads only
+  // the columns it uses. Re-parsing the CSV per query would be far slower, and a disk-backed database (OPFS) is not
+  // available to a page opened from file://.
+  S.dataFile = `__data${++DATA_SEQ}.parquet`;
+  await q(`COPY (SELECT CAST(row_number() OVER () AS INTEGER) AS __rid,
       ${txt(R('client_id'))} AS client_id, ${dateExpr} AS date, CAST(${yExpr} AS TINYINT) AS y, ${scoreExpr} AS score, ${probSel} AS prob,
       CAST(hash(${txt(R('client_id'))} || '|' || CAST(${dateExpr} AS VARCHAR)) % 2147483647 AS INTEGER) AS __hb
       ${others.map(o => `, ${qi(o.src)} AS ${qi(o.name)}`).join('')}
       ${shapDet.cols.map((c, k) => `, CAST(${qi(c.src)} AS FLOAT) AS __shap${k}`).join('')}
       ${shapDet.base ? `, CAST(${qi(shapDet.base)} AS DOUBLE) AS __shap_base` : ''}
-    FROM raw WHERE (${reason}) IS NULL`);
+    FROM raw WHERE (${reason}) IS NULL) TO ${ql(S.dataFile)} (FORMAT PARQUET, COMPRESSION ZSTD)`);
+  await q(`CREATE VIEW data AS SELECT * FROM read_parquet(${ql(S.dataFile)})`);
   S.shap = shapSetup(shapDet, others);
   const nInvalid = total - validRow.n;
   if (nInvalid) {
